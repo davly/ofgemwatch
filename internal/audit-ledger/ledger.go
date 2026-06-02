@@ -185,6 +185,26 @@ func (l *Ledger) BootCheck() int {
 	return l.Len()
 }
 
+// NewScaffoldLedger constructs the Phase-1 in-memory ledger backed by
+// a placeholder Mirror-Mark marker, runs BootCheck (which fires the
+// OFGEMWATCH_AUDIT_LEDGER_PLACEHOLDER_KEY_AT_BOOT R143 LOUD-ONCE-WARN
+// once if placeholder-mode), and returns it.
+//
+// This is the single canonical scaffold-ledger factory shared by the
+// CLI (cmd/ofgemwatch) and the Nexus-facing MCP producer
+// (cmd/ofgemwatch-server / internal/mcpserver) so both surfaces emit
+// through the identical placeholder-key posture. Phase-2 wires a real
+// (corpusSHA, key) here.
+func NewScaffoldLedger() (*Ledger, error) {
+	marker := mirrormark.NewPlaceholderMarker()
+	l, err := NewLedger(marker)
+	if err != nil {
+		return nil, err
+	}
+	l.BootCheck()
+	return l, nil
+}
+
 // NewRIIORow constructs a CanonicalRow for an Ofgem RIIO verdict.
 // Subject is the DNO ID; payload is the wire-form JSON of the
 // verdict.
