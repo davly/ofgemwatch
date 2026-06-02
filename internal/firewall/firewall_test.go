@@ -112,11 +112,49 @@ func scanGoFiles(t *testing.T, includeTests bool) []string {
 			if strings.Contains(path, string(filepath.Separator)+"firewall"+string(filepath.Separator)) {
 				return nil
 			}
+			// R145.B paired-regression shift (2026-06-02 capability
+			// exposure): the Nexus-facing MCP producer host is the ONE
+			// place net/http + env-var reads are permitted, so that
+			// ofgemwatch's deterministic RIIO verdict becomes a Nexus-
+			// routable capability (ADR-001 capability-hub). The two
+			// server packages below are scoped OUT of the substrate
+			// HTTP/env scans; the CLI (cmd/ofgemwatch) and every domain
+			// package stay strictly stdlib-only / HTTP-free / env-free
+			// (still scanned). The confinement is itself pinned by
+			// TestFirewall_HTTPConfinedToProducerHost below — so this is
+			// a SCOPED relaxation, not a hole. ARCHITECTURE.md §Phase 2
+			// "HTTP daemon mode for regulator-pull-based row delivery"
+			// + "firewall test pin shifted via R145.B paired regression".
+			if isProducerHostPath(path) {
+				return nil
+			}
 			out = append(out, path)
 			return nil
 		})
 	}
 	return out
+}
+
+// producerHostDirs are the ONLY two production packages permitted to
+// import net/http + read environment variables, per the 2026-06-02
+// R145.B capability-exposure shift. Kept as a single list so the
+// relaxation in scanGoFiles and the confinement assertion in
+// TestFirewall_HTTPConfinedToProducerHost share one source of truth.
+var producerHostDirs = []string{
+	filepath.Join("internal", "mcpserver"),
+	filepath.Join("cmd", "ofgemwatch-server"),
+}
+
+// isProducerHostPath reports whether path lives inside one of the
+// Nexus-facing producer-host packages (scoped out of the substrate
+// HTTP/env scans).
+func isProducerHostPath(path string) bool {
+	for _, d := range producerHostDirs {
+		if strings.Contains(path, string(filepath.Separator)+d+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 // fileContains reports whether the given file contains any of the
@@ -139,7 +177,10 @@ func fileContains(t *testing.T, path string, patterns ...string) (bool, string) 
 // ---- Substrate-boundary firewall pins ---------------------------------
 
 // TestFirewall_NoNetHTTPListener pins that no production source file
-// imports net/http for listener use.
+// imports net/http for listener use — EXCEPT the Nexus-facing producer
+// host (internal/mcpserver + cmd/ofgemwatch-server), scoped out via
+// scanGoFiles per the 2026-06-02 R145.B capability-exposure shift and
+// re-pinned by TestFirewall_HTTPConfinedToProducerHost.
 func TestFirewall_NoNetHTTPListener(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
 		if hit, p := fileContains(t, path,
@@ -153,17 +194,55 @@ func TestFirewall_NoNetHTTPListener(t *testing.T) {
 }
 
 // TestFirewall_NoHTTPClient pins that no production source imports
-// net/http for client use. (Phase-2 live Ofgem feed will add this
-// on its own R145.B branch.)
+// net/http for client use — EXCEPT the producer host (scoped out via
+// scanGoFiles; see the R145.B note there). The producer host serves
+// HTTP but makes no outbound HTTP client calls; the Phase-2 live Ofgem
+// feed (a real http.Client) will be a separate R145.B branch.
 func TestFirewall_NoHTTPClient(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
 		if hit, p := fileContains(t, path,
-			`"net/http"`,
 			`http.Client`,
 			`http.Get(`,
 			`http.Post(`,
 		); hit {
 			t.Errorf("R145 firewall violation: %s contains %q — HTTP client out of scope at Phase 1", path, p)
+		}
+	}
+}
+
+// TestFirewall_HTTPConfinedToProducerHost is the POSITIVE counterpart
+// of the relaxed listener scan: it asserts that net/http appears in
+// production code ONLY inside the two producer-host packages. This is
+// what keeps the 2026-06-02 R145.B relaxation a SCOPED carve-out
+// rather than a hole — if any other package (the CLI, a domain
+// package) grows a net/http import, this test fails even though the
+// relaxed scan would skip nothing for it. It also confirms the
+// producer host genuinely uses HTTP (so the carve-out is load-bearing,
+// not decorative).
+func TestFirewall_HTTPConfinedToProducerHost(t *testing.T) {
+	root := repoRoot(t)
+	var httpFiles []string
+	roots := []string{filepath.Join(root, "cmd"), filepath.Join(root, "internal")}
+	for _, r := range roots {
+		_ = filepath.Walk(r, func(path string, info os.FileInfo, err error) error {
+			if err != nil || info.IsDir() || !strings.HasSuffix(path, ".go") {
+				return nil
+			}
+			if strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			if hit, _ := fileContains(t, path, `"net/http"`); hit {
+				httpFiles = append(httpFiles, path)
+			}
+			return nil
+		})
+	}
+	if len(httpFiles) == 0 {
+		t.Fatal("expected net/http in the producer host packages, found none — carve-out is decorative")
+	}
+	for _, path := range httpFiles {
+		if !isProducerHostPath(path) {
+			t.Errorf("R145 firewall violation: %s imports net/http but is NOT a producer-host package; net/http MUST stay confined to %v (open a sibling R145.B branch to extend it)", path, producerHostDirs)
 		}
 	}
 }
@@ -185,7 +264,9 @@ func TestFirewall_NoDatabaseSQL(t *testing.T) {
 }
 
 // TestFirewall_NoEnvVarReads pins that no production source reads
-// environment variables.
+// environment variables — EXCEPT the producer host (scoped out via
+// scanGoFiles per the R145.B shift), which reads PORT +
+// OFGEMWATCH_NEXUS_SERVICE_TOKEN. The CLI stays argv-only.
 func TestFirewall_NoEnvVarReads(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
 		if hit, p := fileContains(t, path,
