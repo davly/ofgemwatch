@@ -30,7 +30,11 @@
 // signoff per R150.E ReviewedByCounsel field.
 package ofgemriio
 
-import "fmt"
+import (
+	"fmt"
+	"math"
+	"sort"
+)
 
 // Verdict is the closed-set 3-state outcome enum per R115 SINGLE-ENUM-
 // REJECTION-OUTCOME. Drift here requires R145.B paired-regression.
@@ -209,4 +213,44 @@ func SummariseFleet() (uncertain, compliant, breach, total int) {
 		}
 	}
 	return
+}
+
+// ExcessMillionGBP is the signed £m by which a DNO's reported totex falls
+// OUTSIDE the ±ToleranceBand around its determination: positive = over-spend
+// beyond the band, negative = under-spend beyond it. It returns 0 for any DNO
+// that is not VerdictBreach (compliant or uncertain), so it agrees exactly with
+// Verdict()'s strict band test -- a DNO on the band edge is Compliant -> 0. This
+// turns DeltaPct's magnitude (computed and logged, but read by no decision) into
+// a materiality figure.
+func (d DNO) ExcessMillionGBP() float64 {
+	if d.Verdict() != VerdictBreach {
+		return 0
+	}
+	diff := d.ReportedTotexMillionGBP - d.DeterminationTotexMillionGBP
+	band := d.DeterminationTotexMillionGBP * ToleranceBand
+	if diff > 0 {
+		return diff - band // over-spend beyond the band
+	}
+	return diff + band // under-spend beyond the band (kept negative)
+}
+
+// RankBreachesByMateriality returns the breaching DNOs ordered by absolute £m
+// materiality (largest exposure first), ties broken by ID for determinism;
+// non-breaching DNOs are excluded. A FLAG/signal against the canonical band --
+// not a regulatory determination.
+func RankBreachesByMateriality(dnos []DNO) []DNO {
+	breaches := make([]DNO, 0, len(dnos))
+	for _, d := range dnos {
+		if d.Verdict() == VerdictBreach {
+			breaches = append(breaches, d)
+		}
+	}
+	sort.SliceStable(breaches, func(i, j int) bool {
+		ai, aj := math.Abs(breaches[i].ExcessMillionGBP()), math.Abs(breaches[j].ExcessMillionGBP())
+		if ai != aj {
+			return ai > aj
+		}
+		return breaches[i].ID < breaches[j].ID
+	})
+	return breaches
 }
