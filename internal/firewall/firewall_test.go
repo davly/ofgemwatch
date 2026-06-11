@@ -39,6 +39,21 @@
 //     no auth, no PII persistence, no env-var reads, no money
 //     semantics.** Pure-stdlib Go 1.22.
 //
+// R145.B AMENDMENT (2026-06-11, branch claude/stele-anchor-2026-06-11):
+// ofgemwatch is the first flagship consumer wire to the Stele
+// verified-trust spine. Two inception pins are deliberately
+// NARROWED (not dropped) on this sibling branch, with paired
+// regression pins in TestR145B_SteleAnchorConfinement:
+//
+//   - HTTP CLIENT: permitted ONLY in internal/stele/ (5s-timeout
+//     stdlib client POSTing run-ledger anchors to the spine's
+//     /v1/verdicts). Listener primitives stay banned EVERYWHERE,
+//     including internal/stele/.
+//   - ENV READS: exactly ONE read site is permitted —
+//     os.Getenv(stele.EnvURL) in cmd/ofgemwatch/main.go. Unset/empty
+//     means anchoring is disabled and behavior is byte-identical to
+//     the argv-only inception CLI.
+//
 //   - **Mirror-Mark stamped at every audit-ledger row emit.**
 //     internal/audit-ledger/ledger.go is the load-bearing production
 //     emit-path; placeholder-mode markers fire boot-time R143
@@ -61,6 +76,7 @@ import (
 	"github.com/davly/ofgemwatch/internal/manifest"
 	"github.com/davly/ofgemwatch/internal/mirrormark"
 	ofgemriio "github.com/davly/ofgemwatch/internal/ofgem-riio"
+	"github.com/davly/ofgemwatch/internal/stele"
 )
 
 // repoRoot walks up from the test working directory until it finds
@@ -138,32 +154,59 @@ func fileContains(t *testing.T, path string, patterns ...string) (bool, string) 
 
 // ---- Substrate-boundary firewall pins ---------------------------------
 
+// inSteleDir reports whether path lives under internal/stele/ — the
+// ONE package permitted to hold an HTTP client after the R145.B
+// stele-anchor amendment (2026-06-11).
+func inSteleDir(path string) bool {
+	sep := string(filepath.Separator)
+	return strings.Contains(path, sep+"stele"+sep)
+}
+
 // TestFirewall_NoNetHTTPListener pins that no production source file
-// imports net/http for listener use.
+// imports net/http for listener use. R145.B stele-anchor amendment:
+// internal/stele/ may import net/http (client-only — see
+// TestFirewall_NoHTTPClient) but the listener PRIMITIVES stay banned
+// everywhere, including internal/stele/.
 func TestFirewall_NoNetHTTPListener(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
-		if hit, p := fileContains(t, path,
+		patterns := []string{
 			`"net/http"`,
 			`http.ListenAndServe`,
 			`net.Listen(`,
-		); hit {
+		}
+		if inSteleDir(path) {
+			// The bare import is the client's; listener primitives
+			// remain forbidden even here.
+			patterns = []string{
+				`http.ListenAndServe`,
+				`net.Listen(`,
+				`httptest.NewServer`, // test-double servers belong in _test.go only
+			}
+		}
+		if hit, p := fileContains(t, path, patterns...); hit {
 			t.Errorf("R145 firewall violation: %s contains %q — net/http listener out of scope; open a sibling branch", path, p)
 		}
 	}
 }
 
 // TestFirewall_NoHTTPClient pins that no production source imports
-// net/http for client use. (Phase-2 live Ofgem feed will add this
-// on its own R145.B branch.)
+// net/http for client use — EXCEPT internal/stele/ (R145.B
+// stele-anchor amendment 2026-06-11: the spine-anchoring client is
+// confined to that one package; paired pins in
+// TestR145B_SteleAnchorConfinement). A Phase-2 live Ofgem feed still
+// needs its own R145.B branch.
 func TestFirewall_NoHTTPClient(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
+		if inSteleDir(path) {
+			continue
+		}
 		if hit, p := fileContains(t, path,
 			`"net/http"`,
 			`http.Client`,
 			`http.Get(`,
 			`http.Post(`,
 		); hit {
-			t.Errorf("R145 firewall violation: %s contains %q — HTTP client out of scope at Phase 1", path, p)
+			t.Errorf("R145 firewall violation: %s contains %q — HTTP client out of scope outside internal/stele", path, p)
 		}
 	}
 }
@@ -185,16 +228,36 @@ func TestFirewall_NoDatabaseSQL(t *testing.T) {
 }
 
 // TestFirewall_NoEnvVarReads pins that no production source reads
-// environment variables.
+// environment variables — with ONE R145.B-amended exception
+// (2026-06-11): cmd/ofgemwatch/main.go may contain exactly one
+// os.Getenv call and it MUST be os.Getenv(stele.EnvURL) (the opt-in
+// Stele spine anchoring gate; unset = argv-only behavior unchanged).
+// Everything else — os.LookupEnv, os.Environ, any other Getenv site —
+// stays banned everywhere.
 func TestFirewall_NoEnvVarReads(t *testing.T) {
 	for _, path := range scanGoFiles(t, false) {
-		if hit, p := fileContains(t, path,
+		hit, p := fileContains(t, path,
 			`os.Getenv(`,
 			`os.LookupEnv(`,
 			`os.Environ(`,
-		); hit {
-			t.Errorf("R145 firewall violation: %s contains %q — env-var reads out of scope; argv-only CLI", path, p)
+		)
+		if !hit {
+			continue
 		}
+		if p == `os.Getenv(` && filepath.Base(filepath.Dir(path)) == "ofgemwatch" {
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatalf("read %q: %v", path, err)
+			}
+			src := string(data)
+			if strings.Count(src, "os.Getenv(") == 1 &&
+				strings.Contains(src, "os.Getenv(stele.EnvURL)") &&
+				!strings.Contains(src, "os.LookupEnv(") &&
+				!strings.Contains(src, "os.Environ(") {
+				continue // the single permitted R145.B stele-anchor read
+			}
+		}
+		t.Errorf("R145 firewall violation: %s contains %q — env-var reads out of scope; argv-only CLI (sole exception: os.Getenv(stele.EnvURL) in cmd/ofgemwatch)", path, p)
 	}
 }
 
@@ -248,6 +311,68 @@ func TestFirewall_NoMoneyChecks(t *testing.T) {
 		if hit, p := fileContains(t, path, patterns...); hit {
 			t.Errorf("R145 firewall violation: %s contains %q — payment/billing semantics out of scope", path, p)
 		}
+	}
+}
+
+// ---- R145.B stele-anchor paired regression pins (2026-06-11) ----------
+
+// TestR145B_SteleAnchorConfinement is the paired regression pin for
+// the two NARROWED inception invariants (HTTP client + env read).
+// It pins the NEW invariant shape so any further drift breaks a test:
+//
+//  1. every production net/http usage lives under internal/stele/;
+//  2. the stele client carries the 5-second timeout;
+//  3. os.Getenv appears in exactly one production file
+//     (cmd/ofgemwatch/main.go) and only as os.Getenv(stele.EnvURL);
+//  4. the spine wire-contract constants hold (env var name,
+//     substrate, honest oracle-strength label).
+func TestR145B_SteleAnchorConfinement(t *testing.T) {
+	var netHTTPFiles, getenvFiles []string
+	for _, path := range scanGoFiles(t, false) {
+		if hit, _ := fileContains(t, path, `"net/http"`); hit {
+			netHTTPFiles = append(netHTTPFiles, path)
+		}
+		if hit, _ := fileContains(t, path, `os.Getenv(`); hit {
+			getenvFiles = append(getenvFiles, path)
+		}
+	}
+
+	// (1) net/http confined to internal/stele/ — and present there
+	// (the wire is load-bearing, not decorative).
+	if len(netHTTPFiles) == 0 {
+		t.Errorf("R145.B pin violation: no production file imports net/http — the stele spine wire is gone; re-pin the firewall if this is deliberate")
+	}
+	for _, path := range netHTTPFiles {
+		if !inSteleDir(path) {
+			t.Errorf("R145.B pin violation: %s imports net/http outside internal/stele/", path)
+		}
+	}
+
+	// (2) the stele client keeps its 5s timeout.
+	steleSrc := filepath.Join(repoRoot(t), "internal", "stele", "stele.go")
+	if hit, _ := fileContains(t, steleSrc, `Timeout: 5 * time.Second`); !hit {
+		t.Errorf("R145.B pin violation: %s missing the 5-second http.Client timeout", steleSrc)
+	}
+
+	// (3) exactly one env-read site: os.Getenv(stele.EnvURL) in
+	// cmd/ofgemwatch/main.go.
+	wantGetenv := filepath.Join(repoRoot(t), "cmd", "ofgemwatch", "main.go")
+	if len(getenvFiles) != 1 || getenvFiles[0] != wantGetenv {
+		t.Errorf("R145.B pin violation: os.Getenv sites = %v, want exactly [%s]", getenvFiles, wantGetenv)
+	}
+	if hit, _ := fileContains(t, wantGetenv, `os.Getenv(stele.EnvURL)`); !hit {
+		t.Errorf("R145.B pin violation: %s does not read os.Getenv(stele.EnvURL)", wantGetenv)
+	}
+
+	// (4) spine wire-contract constants.
+	if stele.EnvURL != "OFGEMWATCH_STELE_URL" {
+		t.Errorf("R145.B pin violation: stele.EnvURL = %q, want OFGEMWATCH_STELE_URL", stele.EnvURL)
+	}
+	if stele.Substrate != "flagships/ofgemwatch/audit-ledger" {
+		t.Errorf("R145.B pin violation: stele.Substrate = %q, want flagships/ofgemwatch/audit-ledger", stele.Substrate)
+	}
+	if stele.OracleStrengthSelfCheck != "Self-Check" {
+		t.Errorf("R145.B pin violation: stele.OracleStrengthSelfCheck = %q, want Self-Check (honesty label is load-bearing)", stele.OracleStrengthSelfCheck)
 	}
 }
 
