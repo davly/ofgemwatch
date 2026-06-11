@@ -18,6 +18,7 @@ import (
 	"github.com/davly/ofgemwatch/internal/manifest"
 	"github.com/davly/ofgemwatch/internal/mirrormark"
 	ofgemriio "github.com/davly/ofgemwatch/internal/ofgem-riio"
+	"github.com/davly/ofgemwatch/internal/stele"
 )
 
 const version = "0.1.0-br6-ofgemwatch"
@@ -44,6 +45,13 @@ Commands:
   ledger                  Print the audit-ledger snapshot (Mirror-Mark
                           stamped rows from the current session).
   version                 Print ofgemwatch version
+
+Stele spine anchoring (opt-in):
+  When OFGEMWATCH_STELE_URL is set, riio-check / riio-fleet /
+  entsoe-emit anchor the run's audit ledger into the Stele spine
+  after a passing ledger self-check, and print the spine receipt
+  (seq + entry_hash). Unset = disabled (no HTTP, no new output).
+  A requested anchor that fails exits non-zero.
 
 R143 advisories fired at boot:
   All 5 LOUD-ONCE advisories surface on the first command-invocation
@@ -193,6 +201,8 @@ func runRIIOCheck(ledger *auditledger.Ledger, dnoID string) {
 	fmt.Printf("  mark    = %s\n", marked.Mark)
 	fmt.Printf("  ts      = %s\n", marked.Row.Timestamp)
 	fmt.Printf("  subject = %s\n", marked.Row.Subject)
+
+	maybeAnchorToStele(ledger, "riio-check")
 }
 
 // runRIIOFleet prints the fleet-wide compliance summary.
@@ -219,6 +229,8 @@ func runRIIOFleet(ledger *auditledger.Ledger) {
 	if _, err := ledger.Append(row); err != nil {
 		fmt.Fprintf(os.Stderr, "ledger append failed: %v\n", err)
 	}
+
+	maybeAnchorToStele(ledger, "riio-fleet")
 }
 
 // runENTSOEEmit emits a Phase-1 scaffold ENTSO-E XML report.
@@ -244,6 +256,40 @@ func runENTSOEEmit(ledger *auditledger.Ledger, reportID string) {
 	fmt.Printf("       mark    = %s\n", marked.Mark)
 	fmt.Printf("       ts      = %s\n", marked.Row.Timestamp)
 	fmt.Printf("       subject = %s -->\n", marked.Row.Subject)
+
+	maybeAnchorToStele(ledger, "entsoe-emit")
+}
+
+// maybeAnchorToStele anchors the run's audit ledger into the Stele
+// spine when OFGEMWATCH_STELE_URL is set. Unset/empty = disabled:
+// no self-check, no HTTP, no output — behavior identical to a
+// non-anchoring run. This is ofgemwatch's ONLY env read (R145.B
+// stele-anchor re-pin in internal/firewall/).
+//
+// Honesty rules (load-bearing):
+//   - the sealed line prints ONLY after the spine returned
+//     201 + entry_hash (stele.AnchorRun enforces this);
+//   - a requested anchor that fails — ledger self-check, network,
+//     non-201 — prints to stderr and exits non-zero, so a missing
+//     anchor can never look like success;
+//   - for entsoe-emit the receipt prints as an XML comment, keeping
+//     stdout a well-formed XML document (matching the existing
+//     Mirror-Mark trailer convention).
+func maybeAnchorToStele(ledger *auditledger.Ledger, command string) {
+	rcpt, anchored, err := stele.AnchorRun(os.Getenv(stele.EnvURL), command, ledger, time.Now().UTC())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stele anchor FAILED (%s set, anchor requested but NOT sealed): %v\n", stele.EnvURL, err)
+		os.Exit(1)
+	}
+	if !anchored {
+		return
+	}
+	line := fmt.Sprintf("stele anchor: sealed seq=%d entry_hash=%s", rcpt.Seq, rcpt.EntryHash)
+	if command == "entsoe-emit" {
+		fmt.Printf("<!-- %s -->\n", line)
+	} else {
+		fmt.Println(line)
+	}
 }
 
 // printManifest dumps the 12 manifest entries.

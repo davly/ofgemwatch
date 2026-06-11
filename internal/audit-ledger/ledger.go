@@ -46,8 +46,11 @@
 package auditledger
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -158,6 +161,59 @@ func (l *Ledger) Len() int {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	return len(l.rows)
+}
+
+// SelfCheck re-derives every row's Mirror-Mark from its canonical
+// bytes via this ledger's OWN marker and compares it against the
+// carried mark. On success it returns the row count plus the ledger
+// digest; on the first mismatch it returns a non-nil error and a
+// zero digest (callers MUST NOT anchor/attest a ledger whose
+// self-check failed).
+//
+// LEDGER DIGEST — canonical run serialization (documented contract):
+// sha256 over, for each MarkedRow in append order,
+//
+//	json.Marshal(MarkedRow) || '\n'
+//
+// Go's encoding/json marshals struct fields in declaration order
+// (row, mirror_mark — and inside the row: timestamp, subject, class,
+// payload_json), so the byte stream is deterministic: identical rows
+// in identical order produce an identical digest, and any change to
+// row content, mark, or ORDER changes it. The ledger is not hash-
+// chained (Phase-1 in-memory scaffold), so this digest is the
+// canonical binding for a Stele spine anchor's subject_hash.
+//
+// HONESTY: this is a SELF-check — the same marker that stamped the
+// rows re-derives the marks. It surfaces post-Append tampering of
+// in-memory rows, but it is NOT an independent oracle and does NOT
+// prove the marker key is production-grade (a placeholder-mode
+// marker self-checks green; the R143 boot advisory covers that
+// loudly). Downstream consumers describing this check MUST label it
+// self-check, not gauntlet.
+func (l *Ledger) SelfCheck() (int, [sha256.Size]byte, error) {
+	var digest [sha256.Size]byte
+	snap := l.Snapshot()
+	h := sha256.New()
+	for i, mr := range snap {
+		if !strings.HasPrefix(mr.Mark, mirrormark.MarkPrefix) {
+			return 0, digest, fmt.Errorf("auditledger: self-check failed: row %d mark missing cohort-canonical prefix %q", i, mirrormark.MarkPrefix)
+		}
+		cb, err := mr.Row.CanonicalBytes()
+		if err != nil {
+			return 0, digest, fmt.Errorf("auditledger: self-check failed: row %d canonical bytes: %w", i, err)
+		}
+		if l.marker.Sign(cb) != mr.Mark {
+			return 0, digest, fmt.Errorf("auditledger: self-check failed: row %d mark does not re-derive from canonical bytes (row or mark tampered)", i)
+		}
+		line, err := json.Marshal(mr)
+		if err != nil {
+			return 0, digest, fmt.Errorf("auditledger: self-check failed: row %d serialization: %w", i, err)
+		}
+		h.Write(line)
+		h.Write([]byte{'\n'})
+	}
+	copy(digest[:], h.Sum(nil))
+	return len(snap), digest, nil
 }
 
 // BootCheck is the R175 criterion-3 boot-time R143 LOUD-ONCE-WARN

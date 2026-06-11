@@ -218,6 +218,131 @@ func TestNewENTSOERowShape(t *testing.T) {
 	}
 }
 
+// TestSelfCheckGreenAndDeterministic pins the SelfCheck contract used
+// by Stele spine anchoring: a healthy ledger self-checks green, and
+// the canonical run serialization is deterministic — the same rows in
+// the same order produce the same digest across independent ledgers.
+func TestSelfCheckGreenAndDeterministic(t *testing.T) {
+	var corpus [sha256.Size]byte
+	rowA := CanonicalRow{
+		Timestamp:   "2026-06-11T12:00:00Z",
+		Subject:     "WPD-WMID",
+		Class:       ClassOfgemRIIO,
+		PayloadJSON: `{"verdict":"compliant"}`,
+	}
+	rowB := CanonicalRow{
+		Timestamp:   "2026-06-11T12:00:01Z",
+		Subject:     "RPT-001",
+		Class:       ClassENTSOEXML,
+		PayloadJSON: `<MarketReport/>`,
+	}
+
+	build := func(rows ...CanonicalRow) *Ledger {
+		marker, _ := mirrormark.NewStdlibMarker(corpus, []byte("k"))
+		l, _ := NewLedger(marker)
+		for _, r := range rows {
+			if _, err := l.Append(r); err != nil {
+				t.Fatalf("Append: %v", err)
+			}
+		}
+		return l
+	}
+
+	l1 := build(rowA, rowB)
+	n1, d1, err := l1.SelfCheck()
+	if err != nil {
+		t.Fatalf("SelfCheck on healthy ledger: %v", err)
+	}
+	if n1 != 2 {
+		t.Errorf("SelfCheck count = %d, want 2", n1)
+	}
+	var zero [sha256.Size]byte
+	if d1 == zero {
+		t.Errorf("SelfCheck digest is zero for a non-empty ledger")
+	}
+
+	// Determinism: an independent ledger with the same rows in the
+	// same order produces the same digest.
+	_, d2, err := build(rowA, rowB).SelfCheck()
+	if err != nil {
+		t.Fatalf("SelfCheck on second ledger: %v", err)
+	}
+	if d1 != d2 {
+		t.Errorf("SelfCheck digest non-deterministic: %x vs %x", d1, d2)
+	}
+
+	// Order-sensitivity: append order is load-bearing for an
+	// append-only ledger — swapping rows MUST change the digest.
+	_, d3, err := build(rowB, rowA).SelfCheck()
+	if err != nil {
+		t.Fatalf("SelfCheck on swapped ledger: %v", err)
+	}
+	if d3 == d1 {
+		t.Errorf("SelfCheck digest insensitive to row order: %x", d3)
+	}
+}
+
+// TestSelfCheckDetectsTamper pins the integrity half of SelfCheck:
+// post-Append mutation of row content or carried mark MUST fail the
+// self-check (this is the gate that keeps a tampered ledger from
+// being anchored LIT into the Stele spine).
+func TestSelfCheckDetectsTamper(t *testing.T) {
+	var corpus [sha256.Size]byte
+	row := CanonicalRow{
+		Timestamp:   "2026-06-11T12:00:00Z",
+		Subject:     "WPD-WMID",
+		Class:       ClassOfgemRIIO,
+		PayloadJSON: `{"verdict":"compliant"}`,
+	}
+
+	// Tampered row content.
+	marker, _ := mirrormark.NewStdlibMarker(corpus, []byte("k"))
+	l, _ := NewLedger(marker)
+	_, _ = l.Append(row)
+	l.rows[0].Row.Subject = "WPD-WMID-TAMPERED"
+	if _, _, err := l.SelfCheck(); err == nil {
+		t.Errorf("SelfCheck accepted a tampered row subject, want failure")
+	}
+
+	// Tampered mark (still cohort-prefixed so the prefix gate alone
+	// cannot catch it).
+	marker2, _ := mirrormark.NewStdlibMarker(corpus, []byte("k"))
+	l2, _ := NewLedger(marker2)
+	marked, _ := l2.Append(row)
+	l2.rows[0].Mark = marked.Mark[:len(marked.Mark)-2] + "xx"
+	if _, _, err := l2.SelfCheck(); err == nil {
+		t.Errorf("SelfCheck accepted a tampered mark, want failure")
+	}
+
+	// Mark missing the cohort prefix entirely.
+	marker3, _ := mirrormark.NewStdlibMarker(corpus, []byte("k"))
+	l3, _ := NewLedger(marker3)
+	_, _ = l3.Append(row)
+	l3.rows[0].Mark = "not-a-mark"
+	if _, _, err := l3.SelfCheck(); err == nil {
+		t.Errorf("SelfCheck accepted a prefix-less mark, want failure")
+	}
+}
+
+// TestSelfCheckEmptyLedger pins the empty-ledger shape: zero rows is
+// not an integrity failure (count 0, the sha256 of the empty stream,
+// nil error).
+func TestSelfCheckEmptyLedger(t *testing.T) {
+	var corpus [sha256.Size]byte
+	marker, _ := mirrormark.NewStdlibMarker(corpus, []byte("k"))
+	l, _ := NewLedger(marker)
+	n, d, err := l.SelfCheck()
+	if err != nil {
+		t.Fatalf("SelfCheck on empty ledger: %v", err)
+	}
+	if n != 0 {
+		t.Errorf("SelfCheck count = %d, want 0", n)
+	}
+	if got, want := d, sha256.Sum256(nil); got != want {
+		t.Errorf("empty-ledger digest = %x, want sha256 of empty stream %x", got, want)
+	}
+}
+
 // TestAppendRoundTripCohortVerify pins the R175 cold-verify contract:
 // a row appended via Ledger.Append can be verified by recomputing
 // the canonical bytes + matching the carried Mirror-Mark using the
