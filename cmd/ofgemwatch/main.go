@@ -32,6 +32,8 @@ Commands:
                           stamped audit-ledger row.
   riio-fleet              Print fleet-wide RIIO compliance summary
                           across the 6 canonical DNOs.
+  riio-rank               Rank breaching DNOs by £m materiality outside
+                          the ±15% band (signal, not a determination).
   riio-list               List all canonical DNO IDs.
   entsoe-emit <rpt-id>    Emit a Phase-1 IEC 62325-451-3 transparency
                           XML scaffold for GB area-code. Stamps the
@@ -101,6 +103,9 @@ func main() {
 	case "riio-fleet":
 		_ = fs.Parse(rest)
 		runRIIOFleet(ledger)
+	case "riio-rank":
+		_ = fs.Parse(rest)
+		runRIIORank(ledger)
 	case "riio-list":
 		_ = fs.Parse(rest)
 		for _, d := range ofgemriio.CanonicalDNOs() {
@@ -231,6 +236,27 @@ func runRIIOFleet(ledger *auditledger.Ledger) {
 	}
 
 	maybeAnchorToStele(ledger, "riio-fleet")
+}
+
+// runRIIORank prints breaching DNOs ranked by £m materiality outside the band.
+// A FLAG/signal against the canonical 15% band, not a regulatory determination.
+func runRIIORank(ledger *auditledger.Ledger) {
+	ranked := ofgemriio.RankBreachesByMateriality(ofgemriio.CanonicalDNOs())
+	fmt.Printf("RIIO breach materiality ranking (largest GBPm outside the +/-15%% band first):\n\n")
+	if len(ranked) == 0 {
+		fmt.Println("  no breaches in the canonical fleet.")
+	}
+	for i, d := range ranked {
+		fmt.Printf("  #%d %s (%s): excess %+.1f GBPm  (%+.1f%% vs determination)\n",
+			i+1, d.ID, d.Region, d.ExcessMillionGBP(), d.DeltaPct())
+	}
+	fmt.Println("\nSIGNAL ONLY vs the canonical 15% band -- not a regulatory determination.")
+
+	payload := map[string]any{"summary": "breach-materiality-ranking", "breaches": len(ranked)}
+	row, _ := auditledger.NewRIIORow("BREACH-RANK", payload)
+	if _, err := ledger.Append(row); err != nil {
+		fmt.Fprintf(os.Stderr, "ledger append failed: %v\n", err)
+	}
 }
 
 // runENTSOEEmit emits a Phase-1 scaffold ENTSO-E XML report.
