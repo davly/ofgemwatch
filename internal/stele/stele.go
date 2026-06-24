@@ -96,7 +96,20 @@ type Client struct {
 func NewClient(baseURL string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(strings.TrimSpace(baseURL), "/"),
-		http:    &http.Client{Timeout: 5 * time.Second},
+		http: &http.Client{
+			Timeout: 5 * time.Second,
+			// REFUSE to follow redirects. This is ofgemwatch's only
+			// production outbound path and the POSTed verdict carries the
+			// full subject_hash + evidence. A compromised/misconfigured
+			// spine that returns a 30x must NOT cause that body to be
+			// re-sent to an unconfigured (possibly internal/link-local)
+			// host (SSRF / data-exfil). ErrUseLastResponse returns the
+			// redirect response unfollowed; Seal's strict StatusCode != 201
+			// check then turns it into a clean error without re-POSTing.
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 

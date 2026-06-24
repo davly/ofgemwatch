@@ -153,6 +153,46 @@ func TestSeal201WithoutEntryHash(t *testing.T) {
 	}
 }
 
+// TestSealRefusesRedirect pins the SSRF / data-exfil guard: a spine that
+// answers a redirect (here 302) must NOT cause the verdict body — which
+// carries the full subject_hash and evidence — to be silently re-POSTed
+// to the Location target (an arbitrary, unconfigured, possibly internal
+// host). The redirect must surface as a clean Seal error and the
+// redirect target must receive ZERO requests (proving no body re-send).
+//
+// Discrimination: revert NewClient's CheckRedirect (default client) and
+// this fails — the default http.Client follows the 302, the redirect
+// target's handler fires (redirectHits > 0), and the final 201 makes
+// Seal succeed with nil error.
+func TestSealRefusesRedirect(t *testing.T) {
+	redirectHits := 0
+	var gotSubjectHash string
+	// target is where a followed redirect would land — it must stay cold.
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectHits++
+		var v Verdict
+		_ = json.NewDecoder(r.Body).Decode(&v)
+		gotSubjectHash = v.SubjectHash
+		w.WriteHeader(http.StatusCreated)
+		fmt.Fprintln(w, `{"sealed":{"seq":99,"entry_hash":"exfiltrated"}}`)
+	}))
+	defer target.Close()
+
+	// spine answers a 302 pointing the POST at the (untrusted) target.
+	spine := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+"/v1/verdicts", http.StatusFound)
+	}))
+	defer spine.Close()
+
+	_, err := NewClient(spine.URL).Seal(NewRunAnchor("riio-check", 1, fixedDigest(), time.Now().UTC()))
+	if err == nil {
+		t.Fatalf("Seal against a redirecting spine = nil error, want refusal (redirect must not be followed)")
+	}
+	if redirectHits != 0 {
+		t.Errorf("redirect target received %d requests (subject_hash=%q) — verdict body was re-POSTed to an unconfigured host (SSRF/data-exfil)", redirectHits, gotSubjectHash)
+	}
+}
+
 // TestSealNetworkError pins that a dead spine surfaces as an error.
 func TestSealNetworkError(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {}))
